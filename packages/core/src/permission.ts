@@ -2,6 +2,7 @@ export * as Permission from "./permission.js"
 
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Context, Deferred, Effect, Layer, Schema } from "effect"
+import path from "path"
 import { Permission } from "@opencode/schema/permission"
 import { Bus } from "./bus.js"
 import { Location } from "./location.js"
@@ -84,13 +85,36 @@ export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Permissi
 export type Error = BlockedError | CorrectedError
 
 export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
+  return evaluateRules(action, resource, rulesets.flat())
+}
+
+const pathActions = ["external_directory", "read", "edit"] as const
+
+function isPathAction(action: string) {
+  return pathActions.some((item) => item === action)
+}
+
+// File tools report Location-relative resources, while rules may be written as `./path`.
+// Normalize only the leading `./` so `*` and `..` semantics stay unchanged.
+function normalizePath(value: string) {
+  const normalized = value.replaceAll("\\", "/").replace(/^(?:\.\/)+/, "")
+  return normalized === "" ? "." : normalized
+}
+
+function matchRule(action: string, resource: string, rule: Permission.Rule) {
+  if (!Wildcard.match(action, rule.action)) return false
+  if (!isPathAction(action)) return Wildcard.match(resource, rule.resource)
+  return Wildcard.match(normalizePath(resource), normalizePath(rule.resource))
+}
+
+function evaluateRules(action: string, resource: string, rules: Permission.Ruleset, absolute?: string) {
   return (
-    rulesets
-      .flat()
-      .findLast((rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource)) ?? {
+    rules.findLast((rule) =>
+      matchRule(action, absolute !== undefined && path.isAbsolute(rule.resource) ? absolute : resource, rule),
+    ) ?? {
       action,
       resource: "*",
-      effect: "ask",
+      effect: "ask" as const,
     }
   )
 }
@@ -165,8 +189,15 @@ const layer = Layer.effect(
       return merge(agent?.permissions ?? missingAgentPermissions, session.permissions ?? [])
     })
 
+    // File tools pass Location-relative resources for internal paths, so absolute rules (such as the Plan
+    // directory allow) must also be tried against the resolved path.
+    function evaluateResource(action: string, resource: string, rules: Permission.Ruleset) {
+      const file = (action === "read" || action === "edit") && !path.isAbsolute(resource)
+      return evaluateRules(action, resource, rules, file ? path.resolve(location.directory, resource) : undefined)
+    }
+
     function denied(input: Pick<Request, "action" | "resources">, rules: Permission.Ruleset) {
-      return input.resources.some((resource) => evaluate(input.action, resource, rules).effect === "deny")
+      return input.resources.some((resource) => evaluateResource(input.action, resource, rules).effect === "deny")
     }
 
     function relevant(input: AssertInput, rules: Permission.Ruleset) {
@@ -177,7 +208,7 @@ const layer = Layer.effect(
       const rules = yield* configured(input.sessionID, input.agent)
       if (denied(input, rules)) return { effect: "deny" as const, rules }
       const all = [...rules, ...(yield* savedRules())]
-      const effects = input.resources.map((resource) => evaluate(input.action, resource, all).effect)
+      const effects = input.resources.map((resource) => evaluateResource(input.action, resource, all).effect)
       const effect: Permission.Effect = effects.includes("ask") ? "ask" : "allow"
       const event = yield* hooks.trigger("permission", "evaluate", {
         sessionID: input.sessionID,
@@ -192,7 +223,9 @@ const layer = Layer.effect(
       if (event.effect !== "ask" || unattended === undefined)
         return { effect: event.effect, message: event.message, rules: all }
       const settled = [...all, ...unattended]
-      const allowed = input.resources.every((resource) => evaluate(input.action, resource, settled).effect === "allow")
+      const allowed = input.resources.every(
+        (resource) => evaluateResource(input.action, resource, settled).effect === "allow",
+      )
       if (allowed) return { effect: "allow" as const, rules: all }
       return {
         effect: "deny" as const,

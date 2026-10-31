@@ -17,6 +17,7 @@ import { SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { ShellParse } from "@opencode/core/shell/parse"
 import { eq } from "drizzle-orm"
+import path from "path"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 
@@ -179,6 +180,109 @@ describe("Permission", () => {
     expect(Permission.evaluate("external_directory", "C:/Users/x/proj/src/*", rules).effect).toBe("allow")
     expect(Permission.evaluate("external_directory", "C:/Users/x/other/*", rules).effect).toBe("ask")
   })
+
+  test("matches ./ path rules for read and edit", () => {
+    for (const action of ["read", "edit"]) {
+      const rules: Permission.Ruleset = [{ action, resource: "./Workshop/Checklist.md", effect: "deny" }]
+      expect(Permission.evaluate(action, "Workshop/Checklist.md", rules).effect).toBe("deny")
+      expect(Permission.evaluate(action, "Workshop/Other.md", rules).effect).toBe("ask")
+    }
+    expect(
+      Permission.evaluate("read", "src/nested/a.ts", [{ action: "read", resource: "./src/**", effect: "deny" }]).effect,
+    ).toBe("deny")
+  })
+
+  test("keeps ./ literal for non-path actions", () => {
+    const rules: Permission.Ruleset = [{ action: "shell", resource: "./script.sh", effect: "deny" }]
+    expect(Permission.evaluate("shell", "./script.sh", rules).effect).toBe("deny")
+    expect(Permission.evaluate("shell", "script.sh", rules).effect).toBe("ask")
+  })
+
+  for (const action of ["read", "edit"]) {
+    it.effect(`matches ./ ${action} rules against Location-relative resources`, () =>
+      Effect.gen(function* () {
+        yield* setup([
+          { action, resource: "*", effect: "allow" },
+          { action, resource: "./secret/*", effect: "deny" },
+        ])
+        const service = yield* Permission.Service
+        expect(yield* service.ask(assertion({ action, resources: ["secret/key.txt"] }))).toMatchObject({
+          effect: "deny",
+        })
+        expect(yield* service.ask(assertion({ action, resources: ["public/key.txt"] }))).toMatchObject({
+          effect: "allow",
+        })
+      }),
+    )
+
+    it.effect(`matches absolute ${action} rules against Location-relative resources`, () =>
+      Effect.gen(function* () {
+        yield* setup([
+          { action, resource: "*", effect: "deny" },
+          { action, resource: path.resolve("/project/.opencode/plan/*"), effect: "allow" },
+        ])
+        const service = yield* Permission.Service
+        expect(yield* service.ask(assertion({ action, resources: [".opencode/plan/work.md"] }))).toMatchObject({
+          effect: "allow",
+        })
+        expect(yield* service.ask(assertion({ action, resources: ["source.ts"] }))).toMatchObject({
+          effect: "deny",
+        })
+      }),
+    )
+  }
+
+  it.effect("keeps last-match order across relative and absolute rules", () =>
+    Effect.gen(function* () {
+      yield* setup([
+        { action: "edit", resource: path.resolve("/project/*"), effect: "allow" },
+        { action: "edit", resource: "src/*", effect: "deny" },
+      ])
+      const service = yield* Permission.Service
+      expect(yield* service.ask(assertion({ action: "edit", resources: ["src/a.ts"] }))).toMatchObject({
+        effect: "deny",
+      })
+      expect(yield* service.ask(assertion({ action: "edit", resources: ["b.ts"] }))).toMatchObject({
+        effect: "allow",
+      })
+    }),
+  )
+
+  it.effect("matches absolute rules for external resources", () =>
+    Effect.gen(function* () {
+      yield* setup([
+        { action: "read", resource: "*", effect: "allow" },
+        { action: "read", resource: path.resolve("/outside", "*"), effect: "deny" },
+      ])
+      const service = yield* Permission.Service
+      expect(yield* service.ask(assertion({ resources: [path.resolve("/outside", "secret.txt")] }))).toMatchObject({
+        effect: "deny",
+      })
+    }),
+  )
+
+  it.effect("keeps relative rules scoped to the Location", () =>
+    Effect.gen(function* () {
+      yield* setup([
+        { action: "read", resource: "*", effect: "allow" },
+        { action: "read", resource: "src/*", effect: "deny" },
+      ])
+      const service = yield* Permission.Service
+      expect(yield* service.ask(assertion({ resources: [path.resolve("/outside", "secret.txt")] }))).toMatchObject({
+        effect: "allow",
+      })
+    }),
+  )
+
+  it.effect("keeps a configured ./ deny ahead of saved approvals", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "read", resource: "./secret/*", effect: "deny" }])
+      const saved = yield* PermissionSaved.Service
+      yield* saved.add({ projectID: Project.ID.global, action: "read", resources: ["*"] })
+      const service = yield* Permission.Service
+      expect(yield* service.ask(assertion({ resources: ["secret/key.txt"] }))).toMatchObject({ effect: "deny" })
+    }),
+  )
 
   it.effect("allows managed output reads without granting external directory access", () =>
     Effect.gen(function* () {
